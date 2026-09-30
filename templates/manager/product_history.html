@@ -1,0 +1,1 @@
+{% extends "manager/base.html" %}{% block title %}{{ product.name }} history · Stamp Stock Manager{% endblock %}{% block content %}<div class="topbar"><div><h2>{{ product.name }} history</h2><p>Recorded inventory movements.</p></div></div><section class="card">{% include "manager/movement_table.html" %}</section>{% endblock %}

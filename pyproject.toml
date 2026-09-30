@@ -1,0 +1,10 @@
+[project]
+name = "stamp-stock-manager"
+version = "0.1.0"
+requires-python = "~=3.12.0"
+
+[tool.vercel]
+entrypoint = "stamp_manager.wsgi:application"
+
+[tool.vercel.scripts]
+build = "python manage.py migrate --noinput"
