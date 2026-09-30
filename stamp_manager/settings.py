@@ -91,6 +91,10 @@ if csrf_origins_value is None:
         else f"https://{vercel_url}" if vercel_url else ""
     )
 CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in csrf_origins_value.split(",") if origin.strip()]
+if vercel_url:
+    vercel_origin = f"https://{vercel_url}"
+    if vercel_origin not in CSRF_TRUSTED_ORIGINS:
+        CSRF_TRUSTED_ORIGINS.append(vercel_origin)
 if not DEBUG and not CSRF_TRUSTED_ORIGINS:
     raise ImproperlyConfigured("Set CSRF_TRUSTED_ORIGINS for production, including your HTTPS domain.")
 
@@ -101,3 +105,4 @@ if not DEBUG:
     CSRF_COOKIE_SECURE = True
     SECURE_HSTS_SECONDS = 31536000
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = False

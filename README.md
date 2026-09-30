@@ -11,6 +11,11 @@ py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
+```
+
+Edit `.env` for local development. Set `DEBUG=True`; leave `DATABASE_URL` blank to use the local SQLite database, or configure a PostgreSQL URL. Then run:
+
+```powershell
 python manage.py migrate
 python manage.py seed_sample
 python manage.py runserver
@@ -18,40 +23,22 @@ python manage.py runserver
 
 Open <http://127.0.0.1:8000/>. The sample command creates local starter accounts (`owner` / `stamp1234` and `cashier` / `cashier1234`). It is disabled when `DEBUG=False`; change these demo passwords before using a local database with real data.
 
-The `.env` file accepts `SECRET_KEY`, `DEBUG`, `DATABASE_URL`, `ALLOWED_HOSTS`, and `CSRF_TRUSTED_ORIGINS`. Older `DJANGO_*` names are also accepted. Leave `DATABASE_URL` empty to use SQLite locally, or set it to a PostgreSQL connection URL for local PostgreSQL development.
+## Deploy to Vercel with Neon
 
-Local development uses `db.sqlite3`. That file is intentionally ignored by Git so local business data is not uploaded.
+The Django project package is `stamp_manager`; Vercel serves its `stamp_manager.wsgi:application` entry point. Production uses Neon PostgreSQL through `DATABASE_URL`; production settings fail clearly if the URL or secret is missing. The included [`VERCEL_DEPLOYMENT.md`](VERCEL_DEPLOYMENT.md) has the full setup, environment variables, migration steps, and troubleshooting guide.
 
-## Deploy to Vercel
+Configure `SECRET_KEY`, `DEBUG=False`, `DATABASE_URL`, `ALLOWED_HOSTS`, and `CSRF_TRUSTED_ORIGINS` in Vercel. Set the production domain in the host and CSRF variables. Vercel's build hook in `pyproject.toml` applies migrations, and `STATIC_ROOT` is configured for collected static files. Vercel's Django support serves static assets through its CDN. Local SQLite and local media files are not persistent production storage.
 
-Vercel detects this project from `manage.py` and serves Django static files because `STATIC_ROOT` is configured. A PostgreSQL database is required for persistent hosted data; Vercel function storage is not a persistent database.
-
-1. Push this repository to GitHub, then import it in Vercel.
-2. Add a PostgreSQL database through a Vercel Marketplace provider and connect its `DATABASE_URL` to the project for Production and Preview environments as appropriate.
-3. Set these Vercel environment variables:
-   - `SECRET_KEY`: a unique, randomly generated secret.
-   - `DEBUG`: `False`.
-   - `DATABASE_URL`: supplied by the PostgreSQL integration.
-   - `ALLOWED_HOSTS`: `.vercel.app` and any custom domain, comma-separated. Vercel's `VERCEL_URL` is included automatically.
-   - `CSRF_TRUSTED_ORIGINS`: HTTPS origins for the Vercel domain and any custom domain, comma-separated. The current `VERCEL_URL` origin is included automatically.
-4. Deploy. The Vercel build hook in `pyproject.toml` applies database migrations. Keep Preview and Production database URLs appropriately separated if you use preview deployments.
-5. Run `python manage.py createsuperuser` with the production `DATABASE_URL` configured to create your first administrator. Do not run `seed_sample` on a live database unless you intend to create the sample accounts and data.
-
-There is no `vercel.json` because Vercel detects `manage.py`; `pyproject.toml` selects this project's WSGI application and applies migrations during the build. `STATIC_ROOT` lets Vercel collect and serve static files. See [Vercel's Django deployment guide](https://vercel.com/docs/frameworks/full-stack/django).
-
-The project currently has no user-uploaded media fields or local media handling. If uploads are added later, production files will need persistent object storage; Vercel's function filesystem is not persistent.
+The project has no user-uploaded media fields or local media handling.
 
 ## GitHub upload
 
 The `.gitignore` excludes local databases, credentials, virtual environments, generated static files and Vercel's local project metadata. Commit `.env.example`, but never commit `.env` or production secrets.
 
 ```powershell
-git init
 git add .
-git commit -m "Prepare Django app for deployment"
-git branch -M main
-git remote add origin https://github.com/YOUR-ACCOUNT/YOUR-REPOSITORY.git
-git push -u origin main
+git commit -m "Prepare Django app for Vercel deployment"
+git push
 ```
 
 ## Notes
