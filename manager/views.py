@@ -2,6 +2,7 @@ import json
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, time
+from functools import wraps
 from django.contrib import messages
 from django.contrib.auth import login
 from django.contrib.auth.decorators import login_required
@@ -16,11 +17,11 @@ from .forms import ProductForm, SupplierForm, UserForm
 from .models import AuditLog, Product, ReturnRecord, Sale, SaleItem, StockMovement, Supplier, User
 
 def admin_only(view):
+    @wraps(view)
     def wrapped(request, *args, **kwargs):
         if not request.user.is_authenticated: return redirect_to_login(request.get_full_path())
         if not request.user.can_manage: return HttpResponseForbidden("Administrator access required.")
         return view(request, *args, **kwargs)
-    wrapped.__name__ = view.__name__
     return wrapped
 
 def log_action(user, action, entity, entity_id="", previous=None, new=None):
@@ -45,6 +46,7 @@ def sales_in_range(key):
 
 @login_required
 def dashboard(request):
+    if not request.user.can_manage: return redirect("sales")
     today_sales = sales_in_range("today")
     month_sales = sales_in_range("month")
     all_sales = sales_in_range("all")
@@ -59,8 +61,8 @@ def dashboard(request):
         "stock_value": sum((p.cost_price * p.current_stock for p in stock), Decimal("0")),
         "all_sales": all_sales.aggregate(v=Sum("total_amount"))["v"] or 0,
         "month_sales": month_sales.aggregate(v=Sum("total_amount"))["v"] or 0,
-        "today_profit": today_sales.aggregate(v=Sum("gross_profit"))["v"] or 0,
-        "month_profit": month_sales.aggregate(v=Sum("gross_profit"))["v"] or 0,
+        "today_profit": today_sales.filter(sale_type=Sale.Type.PRODUCT).aggregate(v=Sum("gross_profit"))["v"] or 0,
+        "month_profit": month_sales.filter(sale_type=Sale.Type.PRODUCT).aggregate(v=Sum("gross_profit"))["v"] or 0,
         "total_items_sold": SaleItem.objects.filter(item_type="stock").aggregate(v=Sum("quantity"))["v"] or 0,
     }
     alerts = stock.filter(current_stock__lte=models_f("minimum_stock")).order_by("current_stock")
@@ -125,16 +127,54 @@ def sales(request):
     query = request.GET.get("q", "")
     payment = request.GET.get("payment", "")
     listing = Sale.objects.prefetch_related("items").order_by("-created_at")
+    if not request.user.can_manage: listing = listing.filter(created_by=request.user)
     if query: listing = listing.filter(sale_number__icontains=query) | listing.filter(customer_name__icontains=query)
     if payment: listing = listing.filter(payment_method=payment)
     return render(request, "manager/sales.html", {"products": Product.objects.filter(active=True, track_stock=True), "sales": listing, "query": query, "payment": payment, "payments": Sale.Payment.choices})
 
 @login_required
-def sale_detail(request, pk):
-    sale = get_object_or_404(Sale.objects.prefetch_related("items"), pk=pk)
-    return render(request, "manager/sale_detail.html", {"sale": sale, "auto_print": request.GET.get("print") == "1"})
+def wood_stamp_sales(request):
+    if request.method == "POST":
+        try:
+            quantity = int(request.POST.get("quantity", "0"))
+            price = Decimal(request.POST.get("unit_price", ""))
+            description = request.POST.get("description", "").strip()
+            if quantity < 1: raise ValueError("Quantity must be at least one.")
+            if price < 0: raise ValueError("Selling price cannot be negative.")
+            if not description: raise ValueError("Enter a Wood Stamp description/type.")
+            with transaction.atomic():
+                sale_number = f"SALE-{Sale.objects.count() + 1:05d}"
+                sale = Sale.objects.create(
+                    sale_number=sale_number, sale_type=Sale.Type.WOOD_STAMP,
+                    customer_name=request.POST.get("customer_name", "").strip(),
+                    payment_method=request.POST.get("payment_method", "Cash"),
+                    total_amount=quantity * price, gross_profit=Decimal("0"),
+                    created_by=request.user,
+                )
+                sale_day = parse_date(request.POST.get("date", ""))
+                if sale_day:
+                    sale.created_at = timezone.make_aware(datetime.combine(sale_day, timezone.localtime().time().replace(tzinfo=None)))
+                    sale.save(update_fields=["created_at"])
+                SaleItem.objects.create(sale=sale, product=None, product_name=description,
+                                        item_type="wood_stamp", quantity=quantity,
+                                        unit_price=price, cost_price=None)
+                log_action(request.user, "CREATE_WOOD_STAMP_SALE", "Sale", sale.pk,
+                           new={"sale_number": sale.sale_number, "total": str(sale.total_amount)})
+            messages.success(request, f"{sale.sale_number} saved. Wood Stamp sales do not affect stock or profit.")
+        except (ValueError, InvalidOperation) as exc:
+            messages.error(request, str(exc) or "Check Wood Stamp sale details and try again.")
+        return redirect("wood_stamp_sales")
+    listing = Sale.objects.filter(sale_type=Sale.Type.WOOD_STAMP).prefetch_related("items").order_by("-created_at")
+    if not request.user.can_manage: listing = listing.filter(created_by=request.user)
+    return render(request, "manager/wood_stamp_sales.html", {"sales": listing, "payments": Sale.Payment.choices})
 
 @login_required
+def sale_detail(request, pk):
+    sale = get_object_or_404(Sale.objects.prefetch_related("items"), pk=pk)
+    if not request.user.can_manage and sale.created_by_id != request.user.pk: return HttpResponseForbidden("You may only view your own sales.")
+    return render(request, "manager/sale_detail.html", {"sale": sale, "auto_print": request.GET.get("print") == "1"})
+
+@admin_only
 def inventory(request):
     if request.method == "POST":
         action = request.POST.get("action")
@@ -182,7 +222,7 @@ def inventory(request):
     if q: products = products.filter(name__icontains=q) | products.filter(category__icontains=q) | products.filter(type__icontains=q) | products.filter(color__icontains=q)
     return render(request, "manager/inventory.html", {"products": products, "all_products": Product.objects.filter(active=True, track_stock=True), "movements": StockMovement.objects.select_related("created_by")[:20], "sales": Sale.objects.exclude(status=Sale.Status.VOID).order_by("-created_at"), "query": q})
 
-@login_required
+@admin_only
 def products(request):
     if request.method == "POST":
         if not request.user.can_manage: return HttpResponseForbidden("Administrator access required.")
@@ -224,12 +264,12 @@ def product_toggle(request, pk):
         messages.success(request, f"{p.name} is now {'active' if p.active else 'inactive'}.")
     return redirect("products")
 
-@login_required
+@admin_only
 def product_history(request, pk):
     p = get_object_or_404(Product, pk=pk)
     return render(request, "manager/product_history.html", {"product": p, "movements": p.movements.select_related("created_by")})
 
-@login_required
+@admin_only
 def suppliers(request):
     form = SupplierForm(request.POST or None)
     if request.method == "POST":
@@ -240,7 +280,7 @@ def suppliers(request):
         messages.error(request, "Please check the supplier details.")
     return render(request, "manager/suppliers.html", {"form": form, "suppliers": Supplier.objects.all().order_by("name")})
 
-@login_required
+@admin_only
 def reports(request):
     period = request.GET.get("period", "today")
     if period not in {"today", "yesterday", "week", "month", "all"}: period = "today"
@@ -252,14 +292,14 @@ def reports(request):
     max_amount = max([x["amount"] for x in payments] + [1])
     for x in payments: x["width"] = max(4, int(x["amount"] / max_amount * 100))
     total = listing.aggregate(revenue=Sum("total_amount"), profit=Sum("gross_profit"))["revenue"] or 0
-    profit = listing.aggregate(v=Sum("gross_profit"))["v"] or 0
+    profit = listing.filter(sale_type=Sale.Type.PRODUCT).aggregate(v=Sum("gross_profit"))["v"] or 0
     item_count = SaleItem.objects.filter(sale__in=listing).aggregate(v=Sum("quantity"))["v"] or 0
     stock = list(Product.objects.filter(track_stock=True).order_by("current_stock")[:8])
     max_stock = max([p.current_stock for p in stock] + [1])
     for p in stock: p.chart_width = max(4, int(p.current_stock / max_stock * 100))
     return render(request, "manager/reports.html", {"sales": listing, "period": period, "period_options": [("today", "Today"), ("yesterday", "Yesterday"), ("week", "This week"), ("month", "This month"), ("all", "Cumulative")], "payments": payments, "revenue": total, "profit": profit, "item_count": item_count, "stock": stock})
 
-@login_required
+@admin_only
 def settings_page(request):
     form = UserForm()
     return render(request, "manager/settings.html", {"users": User.objects.filter(is_active=True), "audit": AuditLog.objects.all()[:30], "form": form})
@@ -280,9 +320,8 @@ def switch_user(request, pk):
         messages.success(request, f"Signed in as {user.get_full_name() or user.username} ({user.role}).")
     return redirect(request.POST.get("next", "dashboard"))
 
-@login_required
+@admin_only
 def backup(request):
-    if not request.user.can_manage: return HttpResponseForbidden("Administrator access required.")
     data = {
         "products": list(Product.objects.values()), "suppliers": list(Supplier.objects.values()),
         "sales": list(Sale.objects.values()), "sale_items": list(SaleItem.objects.values()),

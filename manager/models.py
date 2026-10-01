@@ -54,6 +54,9 @@ class Product(models.Model):
     def __str__(self): return self.name
 
 class Sale(models.Model):
+    class Type(models.TextChoices):
+        PRODUCT = "product", "Normal Product Sale"
+        WOOD_STAMP = "wood_stamp", "Wood Stamp"
     class Payment(models.TextChoices):
         CASH = "Cash", "Cash"
         MPESA = "M-Pesa", "M-Pesa"
@@ -65,6 +68,7 @@ class Sale(models.Model):
         RETURNED = "RETURNED", "Returned"
         VOID = "VOID", "Void"
     sale_number = models.CharField(max_length=24, unique=True)
+    sale_type = models.CharField(max_length=20, choices=Type.choices, default=Type.PRODUCT)
     customer_name = models.CharField(max_length=180, blank=True)
     payment_method = models.CharField(max_length=20, choices=Payment.choices, default=Payment.CASH)
     notes = models.TextField(blank=True)
@@ -79,14 +83,16 @@ class SaleItem(models.Model):
     sale = models.ForeignKey(Sale, on_delete=models.CASCADE, related_name="items")
     product = models.ForeignKey(Product, null=True, blank=True, on_delete=models.SET_NULL, related_name="sale_items")
     product_name = models.CharField(max_length=180)
-    item_type = models.CharField(max_length=12, choices=[("stock", "Stock"), ("custom", "Custom")], default="stock")
+    item_type = models.CharField(max_length=20, choices=[("stock", "Stock"), ("custom", "Custom"), ("wood_stamp", "Wood Stamp")], default="stock")
     quantity = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
-    cost_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    cost_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True, default=0)
     @property
     def subtotal(self): return self.quantity * self.unit_price
     @property
-    def item_profit(self): return self.quantity * (self.unit_price - self.cost_price)
+    def item_profit(self):
+        if self.item_type == "wood_stamp": return None
+        return self.quantity * (self.unit_price - (self.cost_price or Decimal("0")))
 
 class StockMovement(models.Model):
     product = models.ForeignKey(Product, null=True, on_delete=models.SET_NULL, related_name="movements")
