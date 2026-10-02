@@ -1,0 +1,8 @@
+{% extends "manager/base.html" %}{% load money %}{% block title %}Edit {{ sale.sale_number }} - Stamp Stock Manager{% endblock %}{% block content %}
+<div class="topbar"><div><h2>Edit sale {{ sale.sale_number }}</h2><p>Changing quantities will reconcile product stock.</p></div><a class="button secondary" href="{% url 'sale_detail' sale.pk %}">Cancel</a></div>
+{% if sale.status != "COMPLETED" %}<section class="card"><p>Only completed sales can be edited. This sale is {{ sale.status }}.</p></section>{% else %}
+<form method="post" class="card">{% csrf_token %}
+<div class="form-grid"><label>Customer name<input name="customer_name" maxlength="180" value="{{ sale.customer_name }}"></label><label>Payment method<select name="payment_method">{% for value,label in payments %}<option value="{{ value }}" {% if sale.payment_method == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label><label>Sale date<input type="date" name="date" value="{{ sale_date }}" required></label></div>
+<label>Notes<textarea name="notes" rows="3">{{ sale.notes }}</textarea></label>
+<h3>Items</h3><div class="table-wrap"><table><thead><tr><th>Item</th><th>Qty</th><th>Unit price</th><th>Current subtotal</th></tr></thead><tbody>{% for item in items %}<tr><td>{{ item.product_name }}</td><td><input type="number" name="quantity[]" min="1" value="{{ item.quantity }}" required></td><td><input type="number" name="unit_price[]" min="0" step="0.01" value="{{ item.unit_price }}" required></td><td>{{ item.subtotal|kes }}</td></tr>{% endfor %}</tbody></table></div>
+<div class="row-actions"><button type="submit">Save sale</button><a class="button secondary" href="{% url 'sale_detail' sale.pk %}">Cancel</a></div></form>{% endif %}{% endblock %}

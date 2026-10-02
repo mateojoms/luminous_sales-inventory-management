@@ -175,6 +175,75 @@ def sale_detail(request, pk):
     return render(request, "manager/sale_detail.html", {"sale": sale, "auto_print": request.GET.get("print") == "1"})
 
 @admin_only
+def sale_edit(request, pk):
+    with transaction.atomic():
+        sale = get_object_or_404(Sale.objects.select_for_update().prefetch_related("items"), pk=pk)
+        items = list(sale.items.all())
+        if request.method == "POST":
+            if sale.status != Sale.Status.COMPLETE:
+                messages.error(request, "Only completed sales can be edited. Returns and voids must remain unchanged.")
+                return redirect("sale_detail", pk=sale.pk)
+            try:
+                quantities = request.POST.getlist("quantity[]")
+                prices = request.POST.getlist("unit_price[]")
+                if len(quantities) != len(items) or len(prices) != len(items):
+                    raise ValueError("Sale items changed. Reload the page and try again.")
+                changes = []
+                for item, qty_text, price_text in zip(items, quantities, prices):
+                    qty = int(qty_text); price = Decimal(price_text)
+                    if qty < 1 or price < 0: raise ValueError("Quantities must be positive and prices cannot be negative.")
+                    changes.append((item, qty, price))
+                old_values = {"customer": sale.customer_name, "payment": sale.payment_method,
+                              "notes": sale.notes, "total": str(sale.total_amount)}
+                customer_name = request.POST.get("customer_name", "").strip()
+                payment_method = request.POST.get("payment_method", sale.payment_method)
+                if payment_method not in dict(Sale.Payment.choices): raise ValueError("Choose a valid payment method.")
+                notes = request.POST.get("notes", "").strip()
+                sale_day = parse_date(request.POST.get("date", ""))
+                if not sale_day: raise ValueError("Enter a valid sale date.")
+                # Reconcile stock by product, accounting for multiple lines of the same product.
+                product_deltas = {}
+                for item, qty, price in changes:
+                    if item.product_id:
+                        product_deltas[item.product_id] = product_deltas.get(item.product_id, 0) + qty - item.quantity
+                locked_products = {product.pk: product for product in Product.objects.select_for_update().filter(pk__in=product_deltas)}
+                for product_id, delta in product_deltas.items():
+                    product = locked_products[product_id]
+                    if product.current_stock < delta:
+                        raise ValueError(f"Insufficient stock to increase {product.name}; only {product.current_stock} units are available.")
+                for product_id, delta in product_deltas.items():
+                    product = locked_products[product_id]
+                    if delta:
+                        before = product.current_stock
+                        product.current_stock -= delta
+                        product.save(update_fields=["current_stock", "updated_at"])
+                        StockMovement.objects.create(product=product, product_name=product.name,
+                            movement_type="SALE EDIT", quantity=-delta, previous_stock=before,
+                            new_stock=product.current_stock, reference=sale.sale_number,
+                            notes="Stock reconciled after sale edit", related_sale=sale, created_by=request.user)
+                total = Decimal("0"); profit = Decimal("0")
+                for item, qty, price in changes:
+                    item.quantity = qty; item.unit_price = price; item.save(update_fields=["quantity", "unit_price"])
+                    total += qty * price
+                    if sale.sale_type != Sale.Type.WOOD_STAMP:
+                        profit += qty * (price - (item.cost_price or Decimal("0")))
+                sale.customer_name = customer_name
+                sale.payment_method = payment_method
+                sale.notes = notes
+                sale.total_amount = total; sale.gross_profit = profit
+                sale.created_at = timezone.make_aware(datetime.combine(sale_day, timezone.localtime(sale.created_at).time().replace(tzinfo=None)))
+                sale.save(update_fields=["customer_name", "payment_method", "notes", "total_amount", "gross_profit", "created_at"])
+                log_action(request.user, "EDIT_SALE", "Sale", sale.pk, previous=old_values,
+                           new={"customer": sale.customer_name, "payment": sale.payment_method,
+                                "notes": sale.notes, "total": str(total)})
+                messages.success(request, f"{sale.sale_number} updated. Stock and totals were reconciled.")
+                return redirect("sale_detail", pk=sale.pk)
+            except (ValueError, InvalidOperation) as exc:
+                messages.error(request, str(exc) or "Check the sale details and try again.")
+    return render(request, "manager/sale_edit.html", {"sale": sale, "items": items, "payments": Sale.Payment.choices,
+        "sale_date": timezone.localtime(sale.created_at).date().isoformat()})
+
+@admin_only
 def inventory(request):
     if request.method == "POST":
         action = request.POST.get("action")
