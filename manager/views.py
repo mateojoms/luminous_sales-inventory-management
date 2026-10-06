@@ -184,15 +184,33 @@ def sale_edit(request, pk):
                 messages.error(request, "Only completed sales can be edited. Returns and voids must remain unchanged.")
                 return redirect("sale_detail", pk=sale.pk)
             try:
+                product_ids = request.POST.getlist("product_id[]")
                 quantities = request.POST.getlist("quantity[]")
                 prices = request.POST.getlist("unit_price[]")
-                if len(quantities) != len(items) or len(prices) != len(items):
-                    raise ValueError("Sale items changed. Reload the page and try again.")
+                custom_names = request.POST.getlist("custom_name[]")
+                if not product_ids or not (len(product_ids) == len(quantities) == len(prices) == len(custom_names)):
+                    raise ValueError("Add at least one complete sale item.")
                 changes = []
-                for item, qty_text, price_text in zip(items, quantities, prices):
+                for selected, qty_text, price_text, custom_name in zip(product_ids, quantities, prices, custom_names):
                     qty = int(qty_text); price = Decimal(price_text)
                     if qty < 1 or price < 0: raise ValueError("Quantities must be positive and prices cannot be negative.")
-                    changes.append((item, qty, price))
+                    if selected == "custom":
+                        if sale.sale_type == Sale.Type.WOOD_STAMP:
+                            kind = "wood_stamp"
+                        else:
+                            kind = "custom"
+                        product = None
+                        name = custom_name.strip()
+                        if not name: raise ValueError("Enter a name for each custom item.")
+                        cost = None if kind == "wood_stamp" else Decimal("0")
+                    else:
+                        product = Product.objects.select_for_update().filter(pk=selected, track_stock=True).first()
+                        if product is None: raise ValueError("Choose an active stock product for each stock item.")
+                        kind = "stock"
+                        name = product.name
+                        previous_item = next((old for old in items if old.product_id == product.pk), None)
+                        cost = previous_item.cost_price if previous_item else product.cost_price
+                    changes.append({"product": product, "name": name, "kind": kind, "quantity": qty, "price": price, "cost": cost})
                 old_values = {"customer": sale.customer_name, "payment": sale.payment_method,
                               "notes": sale.notes, "total": str(sale.total_amount)}
                 customer_name = request.POST.get("customer_name", "").strip()
@@ -203,13 +221,17 @@ def sale_edit(request, pk):
                 if not sale_day: raise ValueError("Enter a valid sale date.")
                 # Reconcile stock by product, accounting for multiple lines of the same product.
                 product_deltas = {}
-                for item, qty, price in changes:
+                for item in items:
                     if item.product_id:
-                        product_deltas[item.product_id] = product_deltas.get(item.product_id, 0) + qty - item.quantity
+                        product_deltas[item.product_id] = product_deltas.get(item.product_id, 0) - item.quantity
+                for change in changes:
+                    product = change["product"]
+                    if product:
+                        product_deltas[product.pk] = product_deltas.get(product.pk, 0) + change["quantity"]
                 locked_products = {product.pk: product for product in Product.objects.select_for_update().filter(pk__in=product_deltas)}
                 for product_id, delta in product_deltas.items():
                     product = locked_products[product_id]
-                    if product.current_stock < delta:
+                    if delta > 0 and product.current_stock < delta:
                         raise ValueError(f"Insufficient stock to increase {product.name}; only {product.current_stock} units are available.")
                 for product_id, delta in product_deltas.items():
                     product = locked_products[product_id]
@@ -222,26 +244,63 @@ def sale_edit(request, pk):
                             new_stock=product.current_stock, reference=sale.sale_number,
                             notes="Stock reconciled after sale edit", related_sale=sale, created_by=request.user)
                 total = Decimal("0"); profit = Decimal("0")
-                for item, qty, price in changes:
-                    item.quantity = qty; item.unit_price = price; item.save(update_fields=["quantity", "unit_price"])
+                for item in items: item.delete()
+                for change in changes:
+                    qty, price = change["quantity"], change["price"]
+                    SaleItem.objects.create(sale=sale, product=change["product"], product_name=change["name"],
+                        item_type=change["kind"], quantity=qty, unit_price=price, cost_price=change["cost"])
                     total += qty * price
                     if sale.sale_type != Sale.Type.WOOD_STAMP:
-                        profit += qty * (price - (item.cost_price or Decimal("0")))
+                        profit += qty * (price - (change["cost"] or Decimal("0")))
                 sale.customer_name = customer_name
                 sale.payment_method = payment_method
                 sale.notes = notes
                 sale.total_amount = total; sale.gross_profit = profit
                 sale.created_at = timezone.make_aware(datetime.combine(sale_day, timezone.localtime(sale.created_at).time().replace(tzinfo=None)))
                 sale.save(update_fields=["customer_name", "payment_method", "notes", "total_amount", "gross_profit", "created_at"])
+                old_values["items"] = [{"product": item.product_name, "quantity": item.quantity, "unit_price": str(item.unit_price)} for item in items]
                 log_action(request.user, "EDIT_SALE", "Sale", sale.pk, previous=old_values,
                            new={"customer": sale.customer_name, "payment": sale.payment_method,
-                                "notes": sale.notes, "total": str(total)})
+                                "notes": sale.notes, "total": str(total),
+                                "items": [{"product": row["name"], "quantity": row["quantity"], "unit_price": str(row["price"])} for row in changes]})
                 messages.success(request, f"{sale.sale_number} updated. Stock and totals were reconciled.")
                 return redirect("sale_detail", pk=sale.pk)
             except (ValueError, InvalidOperation) as exc:
                 messages.error(request, str(exc) or "Check the sale details and try again.")
-    return render(request, "manager/sale_edit.html", {"sale": sale, "items": items, "payments": Sale.Payment.choices,
+    return render(request, "manager/sale_edit.html", {"sale": sale, "items": items, "products": Product.objects.filter(track_stock=True), "payments": Sale.Payment.choices,
         "sale_date": timezone.localtime(sale.created_at).date().isoformat()})
+
+@admin_only
+def sale_delete(request, pk):
+    if request.method != "POST": return HttpResponseForbidden("Use the delete form to remove a sale.")
+    with transaction.atomic():
+        sale = get_object_or_404(Sale.objects.select_for_update().prefetch_related("items"), pk=pk)
+        if sale.status != Sale.Status.COMPLETE:
+            messages.error(request, "Only completed sales without returns can be deleted.")
+            return redirect("sale_detail", pk=sale.pk)
+        if sale.returns.exists():
+            messages.error(request, "Sales with returns cannot be deleted.")
+            return redirect("sale_detail", pk=sale.pk)
+        items = list(sale.items.all())
+        product_quantities = {}
+        for item in items:
+            if item.product_id:
+                product_quantities[item.product_id] = product_quantities.get(item.product_id, 0) + item.quantity
+        products = {p.pk: p for p in Product.objects.select_for_update().filter(pk__in=product_quantities)}
+        for product_id, qty in product_quantities.items():
+            product = products[product_id]
+            before = product.current_stock
+            product.current_stock += qty
+            product.save(update_fields=["current_stock", "updated_at"])
+            StockMovement.objects.create(product=product, product_name=product.name, movement_type="SALE DELETE",
+                quantity=qty, previous_stock=before, new_stock=product.current_stock, reference=sale.sale_number,
+                notes="Stock restored after sale deletion", created_by=request.user)
+        snapshot = {"sale_number": sale.sale_number, "customer": sale.customer_name, "total": str(sale.total_amount),
+                    "items": [{"product": i.product_name, "quantity": i.quantity, "unit_price": str(i.unit_price)} for i in items]}
+        log_action(request.user, "DELETE_SALE", "Sale", sale.pk, previous=snapshot)
+        sale.delete()
+    messages.success(request, "Sale deleted and stock restored.")
+    return redirect("sales")
 
 @admin_only
 def inventory(request):
